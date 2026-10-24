@@ -1,0 +1,125 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bootable-iso:
+    name: Build ISO and boot-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: vertex-os
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential xorriso qemu-system-x86 ovmf
+
+      - name: Install the kernel toolchain
+        run: |
+          # Match rust-toolchain.toml exactly so nothing is installed lazily.
+          rustup toolchain install nightly --profile minimal \
+            --component rust-src --component llvm-tools-preview \
+            --target x86_64-unknown-none
+          rustup show active-toolchain
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo and the kernel build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            vertex-os/kernel/target
+            vertex-os/build/limine
+          key: cargo-${{ runner.os }}-${{ hashFiles('vertex-os/kernel/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Build the kernel and the ISO
+        run: ./tools/build.sh iso
+
+      - name: Hosted node-graph prototype tests
+        run: ./tools/build.sh test
+
+      - name: Boot test - graphical desktop (BIOS)
+        run: |
+          python3 tools/smoke-test.py build/vertex-os.iso \
+            --marker "loom ready" \
+            --commands "" \
+            --screenshot artifacts/loom-bios.png \
+            --log artifacts/loom-bios.log \
+            --expect "graphical front end active" \
+            --expect "constellation: 3 entries under /"
+
+      - name: Boot test - keyboard navigation
+        run: |
+          # Two downs and enter walks from the root into /users.
+          python3 tools/smoke-test.py build/vertex-os.iso \
+            --marker "loom ready" \
+            --keys "{down}{down}{enter}" \
+            --commands "" \
+            --log artifacts/loom-keys.log \
+            --expect "[loom] open /users"
+
+      - name: Boot test - command bar drives the shell
+        run: |
+          python3 tools/smoke-test.py build/vertex-os.iso \
+            --marker "loom ready" \
+            --log artifacts/loom-commands.log \
+            --commands "ls /|write /ci.txt hello from ci|history /ci.txt|dedup" \
+            --expect "wrote /ci.txt" \
+            --expect "version chain for /ci.txt" \
+            --expect "store grew by 0 nodes"
+
+      - name: Boot test - text console fallback
+        run: |
+          # Escape hands the screen back to the text shell.
+          python3 tools/smoke-test.py build/vertex-os.iso \
+            --marker "loom ready" \
+            --keys "{esc}" \
+            --log artifacts/shell.log \
+            --commands "ls /|mkdir /ci|write /ci/notes.txt hi|show /ci/notes.txt" \
+            --expect "Type 'help' for commands." \
+            --expect "wrote /ci/notes.txt" \
+            --expect "verified:   yes"
+
+      - name: Boot test - graphical desktop (UEFI)
+        run: |
+          python3 tools/smoke-test.py build/vertex-os.iso \
+            --marker "loom ready" \
+            --uefi \
+            --commands "" \
+            --screenshot artifacts/loom-uefi.png \
+            --log artifacts/loom-uefi.log \
+            --expect "graphical front end active"
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: vertex-os/artifacts/*.png
+          if-no-files-found: ignore
+
+      - name: Upload the bootable ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: vertex-os-iso
+          path: vertex-os/build/vertex-os.iso
+          if-no-files-found: error
