@@ -1,63 +1,67 @@
-//! Context switching implementation
+//! Low-level context switching.
 //!
-//! Low-level assembly routines for switching between task contexts.
+//! A saved context is nothing but a stack pointer. On the stack, from the
+//! lowest address upwards, it holds:
+//!
+//! ```text
+//!   r15, r14, r13, r12, rbx, rbp, return address
+//! ```
+//!
+//! `switch_context` pushes the callee-saved registers, stores `rsp` into the
+//! outgoing task, loads the incoming `rsp`, pops the same registers and
+//! returns into the incoming task. Because every switch site is either this
+//! call or an interrupt handler that resumes through this call, a task always
+//! resumes exactly where it was switched out.
 
-use super::task::Context;
+use crate::sched::task::Context;
 
 extern "C" {
-    /// Switch from one task context to another
-    /// 
-    /// # Arguments
-    /// * `old_ctx` - Pointer to save the current context (stack pointer)
-    /// * `new_ctx` - Pointer to the new context to load (stack pointer)
-    /// 
+    /// Switch stacks; see the module documentation for the frame layout.
+    ///
     /// # Safety
-    /// Both pointers must be valid and properly aligned.
-    /// The new context must have been set up by setup_stack or a previous switch_context.
-    pub fn switch_context(old_ctx: *mut u64, new_ctx: u64);
+    /// `old_slot` must point at writable storage and `new_stack_ptr` must be a
+    /// stack set up by `Task::setup_stack` or a previous switch.
+    pub fn switch_context(old_slot: *mut u64, new_stack_ptr: u64);
 }
 
-core::arch::global_asm!(r#"
-.global switch_context
+core::arch::global_asm!(
+    r#"
+    .text
+    .global switch_context
 
-// switch_context(old_ctx: *mut u64, new_ctx: u64)
-// rdi = pointer to old task's stack pointer (to save current rsp)
-// rsi = new task's stack pointer (to load)
+# switch_context(old_slot: *mut u64, new_stack_ptr: u64)
+#   rdi = where to store the outgoing stack pointer
+#   rsi = incoming stack pointer
 switch_context:
-    // Save callee-saved registers on the current stack
-    // These are the registers that must be preserved across function calls
     push rbp
     push rbx
     push r12
     push r13
     push r14
     push r15
-    
-    // Save the current stack pointer to *old_ctx
+
     mov [rdi], rsp
-    
-    // Load the new stack pointer
     mov rsp, rsi
-    
-    // Restore callee-saved registers from the new stack
+
     pop r15
     pop r14
     pop r13
     pop r12
     pop rbx
     pop rbp
-    
-    // Return to the new task
-    // (the return address is now on top of the stack)
-    ret
-"#);
 
-/// Perform a context switch from the current task to a new task
-/// 
+    ret
+    "#
+);
+
+/// Switch from the current task's stack to `new_stack_ptr`.
+///
 /// # Safety
-/// - Must be called with interrupts disabled
-/// - Both stack pointers must be valid
+/// Interrupts must be disabled and both stacks must be valid.
 #[inline]
-pub unsafe fn do_switch(old_stack_ptr: *mut u64, new_stack_ptr: u64) {
-    switch_context(old_stack_ptr, new_stack_ptr);
+pub unsafe fn switch(old_slot: *mut u64, new_stack_ptr: u64) {
+    switch_context(old_slot, new_stack_ptr);
 }
+
+/// Size of the saved frame described above.
+pub const CONTEXT_FRAME_SIZE: usize = core::mem::size_of::<Context>();

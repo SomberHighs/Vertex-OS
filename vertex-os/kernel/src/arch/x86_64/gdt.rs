@@ -1,11 +1,11 @@
-//! Global Descriptor Table (GDT) for x86_64
+//! Global Descriptor Table.
 //!
-//! In 64-bit long mode, segmentation is mostly disabled, but we still need
-//! a minimal GDT with null, kernel code, and kernel data segments.
+//! Long mode barely uses segmentation, but we still need a valid GDT with a
+//! 64-bit code and data descriptor to reload the segment registers after
+//! taking over from the bootloader.
 
 use core::mem::size_of;
 
-/// GDT Entry (Segment Descriptor)
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct GdtEntry {
@@ -28,40 +28,38 @@ impl GdtEntry {
             base_high: 0,
         }
     }
-    
-    /// Create a kernel code segment (64-bit)
+
+    /// Ring 0, 64-bit code: present, executable, readable.
     const fn kernel_code() -> Self {
         Self {
             limit_low: 0xFFFF,
             base_low: 0,
             base_middle: 0,
-            access: 0x9A,       // Present, Ring 0, Code, Executable, Readable
-            granularity: 0xAF, // 4K granularity, 64-bit
+            access: 0x9A,
+            granularity: 0xAF, // 4 KiB granularity, long mode
             base_high: 0,
         }
     }
-    
-    /// Create a kernel data segment
+
+    /// Ring 0, writable data.
     const fn kernel_data() -> Self {
         Self {
             limit_low: 0xFFFF,
             base_low: 0,
             base_middle: 0,
-            access: 0x92,       // Present, Ring 0, Data, Writable
-            granularity: 0xCF, // 4K granularity, 32-bit (ignored in 64-bit mode)
+            access: 0x92,
+            granularity: 0xCF,
             base_high: 0,
         }
     }
 }
 
-/// GDT Pointer structure for lgdt instruction
 #[repr(C, packed)]
 struct GdtPointer {
     limit: u16,
     base: u64,
 }
 
-/// The Global Descriptor Table
 #[repr(C, align(16))]
 struct Gdt {
     null: GdtEntry,
@@ -69,55 +67,66 @@ struct Gdt {
     kernel_data: GdtEntry,
 }
 
-static mut GDT: Gdt = Gdt {
+#[used]
+#[unsafe(link_section = ".data")]
+static GDT: Gdt = Gdt {
     null: GdtEntry::null(),
     kernel_code: GdtEntry::kernel_code(),
     kernel_data: GdtEntry::kernel_data(),
 };
 
-/// Kernel code segment selector (index 1, Ring 0)
 pub const KERNEL_CODE_SELECTOR: u16 = 0x08;
-
-/// Kernel data segment selector (index 2, Ring 0)
 pub const KERNEL_DATA_SELECTOR: u16 = 0x10;
 
-/// Initialize the GDT
+extern "C" {
+    /// Far-return trampoline that reloads CS (defined below).
+    fn vertex_reload_cs(selector: u64);
+    /// Reload DS/ES/FS/GS/SS from one selector.
+    fn vertex_load_data_segments(selector: u64);
+}
+
+core::arch::global_asm!(
+    r#"
+    .section .text
+    .global vertex_reload_cs
+vertex_reload_cs:
+    # rdi = new CS selector. A far return is the only way to reload CS in
+    # long mode: push [selector, target] and retfq into it.
+    push rdi
+    lea rax, [rip + 1f]
+    push rax
+    retfq
+1:
+    ret
+
+    .global vertex_load_data_segments
+vertex_load_data_segments:
+    # rdi = selector
+    mov eax, edi
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+    ret
+    "#
+);
+
+/// Load the Vertex GDT and reload every segment register.
 pub fn init() {
+    let pointer = GdtPointer {
+        limit: (size_of::<Gdt>() - 1) as u16,
+        base: &GDT as *const Gdt as u64,
+    };
+
     unsafe {
-        let gdt_ptr = GdtPointer {
-            limit: (size_of::<Gdt>() - 1) as u16,
-            base: &GDT as *const _ as u64,
-        };
-        
-        // Load the GDT
         core::arch::asm!(
             "lgdt [{}]",
-            in(reg) &gdt_ptr,
+            in(reg) &pointer,
             options(readonly, nostack, preserves_flags)
         );
-        
-        // Reload segment registers
-        // We need to do a far jump to reload CS
-        core::arch::asm!(
-            "push {sel}",
-            "lea {tmp}, [rip + 2f]",
-            "push {tmp}",
-            "retfq",
-            "2:",
-            sel = in(reg) KERNEL_CODE_SELECTOR as u64,
-            tmp = lateout(reg) _,
-            options(preserves_flags)
-        );
-        
-        // Reload data segment registers
-        core::arch::asm!(
-            "mov ds, {0:x}",
-            "mov es, {0:x}",
-            "mov fs, {0:x}",
-            "mov gs, {0:x}",
-            "mov ss, {0:x}",
-            in(reg) KERNEL_DATA_SELECTOR,
-            options(nostack, preserves_flags)
-        );
+
+        vertex_load_data_segments(KERNEL_DATA_SELECTOR as u64);
+        vertex_reload_cs(KERNEL_CODE_SELECTOR as u64);
     }
 }

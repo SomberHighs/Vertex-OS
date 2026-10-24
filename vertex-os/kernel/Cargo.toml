@@ -1,19 +1,20 @@
 [package]
 name = "vertex-kernel"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Vertex OS Contributors"]
+description = "Vertex OS: a content-addressed microkernel in Rust"
 
 [dependencies]
-limine = "0.2"
-spin = "0.9"
-bitflags = "2.4"
-volatile = "0.5"
+# Rust interface for the Limine boot protocol (base revision 6, Limine 8.x).
+limine = "0.6.5"
 
 [profile.dev]
 panic = "abort"
+opt-level = 1
 
 [profile.release]
 panic = "abort"
 lto = true
-opt-level = "z"
+opt-level = "s"
+codegen-units = 1

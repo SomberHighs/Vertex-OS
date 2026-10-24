@@ -1,220 +1,208 @@
-//! Virtual Memory Manager
+//! Virtual memory manager: 4-level paging on the active address space.
 //!
-//! Handles page table management and virtual address space operations.
+//! Limine leaves us with an identity-ish kernel mapping, the higher-half direct
+//! map (HHDM) and the kernel image mapped at `0xffffffff80000000`. We keep that
+//! PML4 and extend it: new page tables are allocated from the PMM and reached
+//! through the HHDM.
 
 use super::addr::{PhysAddr, VirtAddr, PAGE_SIZE};
 use super::pmm;
-use bitflags::bitflags;
+use crate::arch::x86_64::cpu;
 
-bitflags! {
-    /// Page table entry flags
-    #[derive(Clone, Copy, Debug)]
-    pub struct PageFlags: u64 {
-        /// Page is present in memory
-        const PRESENT = 1 << 0;
-        /// Page is writable
-        const WRITABLE = 1 << 1;
-        /// Page is accessible from user mode
-        const USER = 1 << 2;
-        /// Write-through caching
-        const WRITE_THROUGH = 1 << 3;
-        /// Disable caching
-        const NO_CACHE = 1 << 4;
-        /// Page was accessed
-        const ACCESSED = 1 << 5;
-        /// Page was written to
-        const DIRTY = 1 << 6;
-        /// Huge page (2MiB or 1GiB)
-        const HUGE = 1 << 7;
-        /// Global page (not flushed on CR3 switch)
-        const GLOBAL = 1 << 8;
-        /// Disable execution
-        const NO_EXECUTE = 1 << 63;
-    }
+pub mod flags {
+    pub const PRESENT: u64 = 1 << 0;
+    pub const WRITABLE: u64 = 1 << 1;
+    pub const USER: u64 = 1 << 2;
+    pub const WRITE_THROUGH: u64 = 1 << 3;
+    pub const NO_CACHE: u64 = 1 << 4;
+    pub const ACCESSED: u64 = 1 << 5;
+    pub const DIRTY: u64 = 1 << 6;
+    pub const HUGE: u64 = 1 << 7;
+    pub const GLOBAL: u64 = 1 << 8;
+    pub const NO_EXECUTE: u64 = 1 << 63;
 }
 
-/// A page table entry
+/// Flags for ordinary kernel data pages.
+pub const KERNEL_DATA: u64 =
+    flags::PRESENT | flags::WRITABLE | flags::GLOBAL | flags::NO_EXECUTE;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapError {
+    AlreadyMapped,
+    OutOfMemory,
+    HugePageConflict,
+}
+
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct PageTableEntry(u64);
 
 impl PageTableEntry {
-    /// Create a new empty entry
-    pub const fn new() -> Self {
+    pub const fn empty() -> Self {
         Self(0)
     }
-    
-    /// Create an entry with address and flags
-    pub const fn with_addr_flags(addr: PhysAddr, flags: PageFlags) -> Self {
-        Self((addr.as_u64() & 0x000F_FFFF_FFFF_F000) | flags.bits())
+
+    #[inline]
+    pub fn is_present(self) -> bool {
+        self.0 & flags::PRESENT != 0
     }
-    
-    /// Get the flags
-    pub fn flags(&self) -> PageFlags {
-        PageFlags::from_bits_truncate(self.0)
+
+    #[inline]
+    pub fn is_huge(self) -> bool {
+        self.0 & flags::HUGE != 0
     }
-    
-    /// Get the physical address
-    pub fn addr(&self) -> PhysAddr {
+
+    #[inline]
+    pub fn addr(self) -> PhysAddr {
         PhysAddr::new(self.0 & 0x000F_FFFF_FFFF_F000)
     }
-    
-    /// Check if present
-    pub fn is_present(&self) -> bool {
-        self.0 & PageFlags::PRESENT.bits() != 0
+
+    #[inline]
+    pub fn set(&mut self, addr: PhysAddr, flags: u64) {
+        self.0 = (addr.as_u64() & 0x000F_FFFF_FFFF_F000) | flags;
     }
-    
-    /// Check if huge page
-    pub fn is_huge(&self) -> bool {
-        self.0 & PageFlags::HUGE.bits() != 0
-    }
-    
-    /// Set the entry
-    pub fn set(&mut self, addr: PhysAddr, flags: PageFlags) {
-        self.0 = (addr.as_u64() & 0x000F_FFFF_FFFF_F000) | flags.bits();
-    }
-    
-    /// Clear the entry
+
+    #[inline]
     pub fn clear(&mut self) {
         self.0 = 0;
     }
 }
 
-/// A page table (512 entries)
+/// One page table: 512 entries covering 2 MiB of address space.
 #[repr(C, align(4096))]
 pub struct PageTable {
     entries: [PageTableEntry; 512],
 }
 
 impl PageTable {
-    /// Create a new empty page table
-    pub const fn new() -> Self {
-        Self {
-            entries: [PageTableEntry::new(); 512],
-        }
+    /// The PML4 currently loaded in CR3.
+    ///
+    /// # Safety
+    /// The caller must not replace CR3's tables underneath the returned
+    /// reference, and must keep interrupts disabled while mutating it.
+    pub unsafe fn active() -> &'static mut PageTable {
+        let cr3 = cpu::read_cr3() & 0x000F_FFFF_FFFF_F000;
+        let virt = pmm::phys_to_virt(PhysAddr::new(cr3));
+        &mut *virt.as_mut_ptr::<PageTable>()
     }
-    
-    /// Get an entry
-    pub fn entry(&self, index: usize) -> &PageTableEntry {
-        &self.entries[index]
+
+    #[inline]
+    pub fn entry(&self, index: usize) -> PageTableEntry {
+        self.entries[index]
     }
-    
-    /// Get a mutable entry
+
+    #[inline]
     pub fn entry_mut(&mut self, index: usize) -> &mut PageTableEntry {
         &mut self.entries[index]
     }
 }
 
-/// Higher Half Direct Map offset (set during init)
-static mut HHDM_OFFSET: u64 = 0;
-
-/// Initialize the virtual memory manager
-pub fn init(hhdm_offset: u64) {
-    unsafe {
-        HHDM_OFFSET = hhdm_offset;
+/// Walk `table` and return the table at `index`, allocating it if `create`.
+unsafe fn next_table(
+    table: &mut PageTable,
+    index: usize,
+    create: bool,
+) -> Result<&'static mut PageTable, MapError> {
+    let entry = table.entry_mut(index);
+    if !entry.is_present() {
+        if !create {
+            return Err(MapError::OutOfMemory);
+        }
+        let page = pmm::alloc_page().ok_or(MapError::OutOfMemory)?;
+        entry.set(page, flags::PRESENT | flags::WRITABLE | flags::NO_EXECUTE);
+        return Ok(&mut *pmm::phys_to_virt(page).as_mut_ptr::<PageTable>());
     }
+    if entry.is_huge() {
+        return Err(MapError::HugePageConflict);
+    }
+    Ok(&mut *pmm::phys_to_virt(entry.addr()).as_mut_ptr::<PageTable>())
 }
 
-/// Convert a physical address to a virtual address using HHDM
-pub fn phys_to_virt(phys: PhysAddr) -> VirtAddr {
-    unsafe { VirtAddr::new(phys.as_u64() + HHDM_OFFSET) }
-}
-
-/// Convert a virtual address to a physical address (only works for HHDM addresses)
-pub fn virt_to_phys(virt: VirtAddr) -> PhysAddr {
-    unsafe { PhysAddr::new(virt.as_u64() - HHDM_OFFSET) }
-}
-
-/// Map a virtual address to a physical address
-/// 
+/// Map one 4 KiB page.
+///
 /// # Safety
-/// Caller must ensure the addresses are valid and the mapping won't cause issues.
+/// Caller must hold the address-space lock (interrupts off) and must not map
+/// an address that is already in use.
 pub unsafe fn map_page(
     pml4: &mut PageTable,
     virt: VirtAddr,
     phys: PhysAddr,
-    flags: PageFlags,
-) -> Result<(), &'static str> {
+    flags: u64,
+) -> Result<(), MapError> {
     let indices = virt.page_table_indices();
-    
-    // Get or create PDPT
-    let pdpt = get_or_create_table(pml4, indices[0], flags)?;
-    
-    // Get or create PD
-    let pd = get_or_create_table(pdpt, indices[1], flags)?;
-    
-    // Get or create PT
-    let pt = get_or_create_table(pd, indices[2], flags)?;
-    
-    // Set the page table entry
+
+    let pdpt = next_table(pml4, indices[0], true)?;
+    let pd = next_table(pdpt, indices[1], true)?;
+    let pt = next_table(pd, indices[2], true)?;
+
     let entry = pt.entry_mut(indices[3]);
     if entry.is_present() {
-        return Err("Page already mapped");
+        return Err(MapError::AlreadyMapped);
     }
-    
-    entry.set(phys, flags | PageFlags::PRESENT);
-    
+    entry.set(phys, flags | flags::PRESENT);
     Ok(())
 }
 
-/// Unmap a virtual address
-/// 
+/// Unmap one page and return its physical address.
+///
 /// # Safety
-/// Caller must ensure the address is mapped and unmapping won't cause issues.
-pub unsafe fn unmap_page(pml4: &mut PageTable, virt: VirtAddr) -> Result<PhysAddr, &'static str> {
+/// See [`map_page`].
+pub unsafe fn unmap_page(
+    pml4: &mut PageTable,
+    virt: VirtAddr,
+) -> Result<PhysAddr, MapError> {
     let indices = virt.page_table_indices();
-    
-    // Walk the page tables
-    let pdpt = get_table(pml4, indices[0]).ok_or("PDPT not present")?;
-    let pd = get_table(pdpt, indices[1]).ok_or("PD not present")?;
-    let pt = get_table(pd, indices[2]).ok_or("PT not present")?;
-    
+
+    let pdpt = next_table(pml4, indices[0], false)?;
+    let pd = next_table(pdpt, indices[1], false)?;
+    let pt = next_table(pd, indices[2], false)?;
+
     let entry = pt.entry_mut(indices[3]);
     if !entry.is_present() {
-        return Err("Page not mapped");
+        return Err(MapError::AlreadyMapped);
     }
-    
     let phys = entry.addr();
     entry.clear();
-    
-    // Invalidate TLB entry
-    crate::arch::x86_64::cpu::invlpg(virt.as_u64());
-    
+    cpu::invlpg(virt.as_u64());
     Ok(phys)
 }
 
-/// Get or create a page table at the given index
-unsafe fn get_or_create_table(
-    parent: &mut PageTable,
-    index: usize,
-    flags: PageFlags,
-) -> Result<&mut PageTable, &'static str> {
-    let entry = parent.entry_mut(index);
-    
-    if !entry.is_present() {
-        // Allocate a new page table
-        let page = pmm::alloc_page().ok_or("Out of memory")?;
-        
-        // Zero the new page table
-        let virt = phys_to_virt(page);
-        core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, PAGE_SIZE as usize);
-        
-        // Set the entry
-        entry.set(page, flags | PageFlags::PRESENT | PageFlags::WRITABLE);
-    }
-    
-    let addr = phys_to_virt(entry.addr());
-    Ok(&mut *addr.as_mut_ptr::<PageTable>())
-}
+/// Translate a virtual address using the given page table root.
+pub unsafe fn translate(pml4: &PageTable, virt: VirtAddr) -> Option<PhysAddr> {
+    let indices = virt.page_table_indices();
 
-/// Get a page table at the given index
-unsafe fn get_table(parent: &PageTable, index: usize) -> Option<&mut PageTable> {
-    let entry = parent.entry(index);
-    
-    if !entry.is_present() {
+    let pml4e = pml4.entry(indices[0]);
+    if !pml4e.is_present() {
         return None;
     }
-    
-    let addr = phys_to_virt(entry.addr());
-    Some(&mut *addr.as_mut_ptr::<PageTable>())
+    let pdpt = &*pmm::phys_to_virt(pml4e.addr()).as_ptr::<PageTable>();
+    let pdpte = pdpt.entry(indices[1]);
+    if !pdpte.is_present() {
+        return None;
+    }
+    if pdpte.is_huge() {
+        // 1 GiB page.
+        return Some(PhysAddr::new(
+            pdpte.addr().as_u64() + virt.as_u64() % super::addr::HUGE_PAGE_SIZE,
+        ));
+    }
+    let pd = &*pmm::phys_to_virt(pdpte.addr()).as_ptr::<PageTable>();
+    let pde = pd.entry(indices[2]);
+    if !pde.is_present() {
+        return None;
+    }
+    if pde.is_huge() {
+        // 2 MiB page.
+        return Some(PhysAddr::new(
+            pde.addr().as_u64() + virt.as_u64() % super::addr::LARGE_PAGE_SIZE,
+        ));
+    }
+    let pt = &*pmm::phys_to_virt(pde.addr()).as_ptr::<PageTable>();
+    let pte = pt.entry(indices[3]);
+    if !pte.is_present() {
+        return None;
+    }
+    Some(PhysAddr::new(
+        pte.addr().as_u64() + virt.page_offset() % PAGE_SIZE,
+    ))
 }

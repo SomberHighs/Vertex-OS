@@ -1,0 +1,14 @@
+# Build artefacts
+build/
+target/
+*.iso
+
+# Hosted prototype binaries
+test_node
+*.o
+
+# Boot-test output
+artifacts/
+
+# Local tooling (locally extracted cross tools, package fetchers)
+tools-local/

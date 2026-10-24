@@ -1,14 +1,17 @@
-//! Interrupt handlers for x86_64
+//! Interrupt and exception entry stubs.
+//!
+//! Every stub is a `naked` function: it saves the full register set, aligns the
+//! stack for the SysV ABI, calls a Rust handler with a pointer to the saved
+//! frame, and returns with `iretq`. Aligning the stack matters because rustc
+//! may emit SSE moves that fault on unaligned addresses.
 
 use crate::kprintln;
 use super::cpu;
 use super::keyboard;
 use super::timer;
 
-/// Interrupt stack frame pushed by the CPU (without error code)
-/// This matches what the CPU pushes on the stack when an interrupt occurs
+/// The frame the CPU pushes on a same-privilege interrupt.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
 pub struct InterruptStackFrame {
     pub instruction_pointer: u64,
     pub code_segment: u64,
@@ -17,9 +20,8 @@ pub struct InterruptStackFrame {
     pub stack_segment: u64,
 }
 
-/// Saved register state during interrupt
+/// General purpose registers, in the order they are pushed.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
 pub struct SavedRegisters {
     pub r15: u64,
     pub r14: u64,
@@ -38,17 +40,13 @@ pub struct SavedRegisters {
     pub rax: u64,
 }
 
-/// Combined exception context for handlers without error code
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
 pub struct ExceptionContext {
     pub regs: SavedRegisters,
     pub frame: InterruptStackFrame,
 }
 
-/// Combined exception context for handlers with error code
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
 pub struct ExceptionContextWithError {
     pub regs: SavedRegisters,
     pub error_code: u64,
@@ -56,19 +54,17 @@ pub struct ExceptionContextWithError {
 }
 
 impl InterruptStackFrame {
-    /// Print the interrupt stack frame
-    pub fn dump(&self) {
-        kprintln!("  RIP: {:#018x}", self.instruction_pointer);
-        kprintln!("  CS:  {:#06x}", self.code_segment);
+    fn dump(&self) {
+        kprintln!("  RIP:   {:#018x}", self.instruction_pointer);
+        kprintln!("  CS:    {:#06x}", self.code_segment);
         kprintln!("  FLAGS: {:#018x}", self.cpu_flags);
-        kprintln!("  RSP: {:#018x}", self.stack_pointer);
-        kprintln!("  SS:  {:#06x}", self.stack_segment);
+        kprintln!("  RSP:   {:#018x}", self.stack_pointer);
+        kprintln!("  SS:    {:#06x}", self.stack_segment);
     }
 }
 
 impl SavedRegisters {
-    /// Print all saved registers
-    pub fn dump(&self) {
+    fn dump(&self) {
         kprintln!("  RAX: {:#018x}  RBX: {:#018x}", self.rax, self.rbx);
         kprintln!("  RCX: {:#018x}  RDX: {:#018x}", self.rcx, self.rdx);
         kprintln!("  RSI: {:#018x}  RDI: {:#018x}", self.rsi, self.rdi);
@@ -80,502 +76,338 @@ impl SavedRegisters {
     }
 }
 
-/// Page fault error code flags
 pub mod page_fault_error {
-    pub const PRESENT: u64 = 1 << 0;      // Page was present
-    pub const WRITE: u64 = 1 << 1;        // Write access caused fault
-    pub const USER: u64 = 1 << 2;         // Fault occurred in user mode
-    pub const RESERVED: u64 = 1 << 3;     // Reserved bit set in page table
-    pub const INSTRUCTION: u64 = 1 << 4;  // Instruction fetch caused fault
+    pub const PRESENT: u64 = 1 << 0;
+    pub const WRITE: u64 = 1 << 1;
+    pub const USER: u64 = 1 << 2;
+    pub const RESERVED: u64 = 1 << 3;
+    pub const INSTRUCTION: u64 = 1 << 4;
 }
 
-/// Decode page fault error code into human readable string
-fn decode_page_fault_error(error: u64) -> &'static str {
-    use page_fault_error::*;
-    
-    let present = error & PRESENT != 0;
-    let write = error & WRITE != 0;
-    let user = error & USER != 0;
-    let instruction = error & INSTRUCTION != 0;
-    
-    match (present, write, user, instruction) {
-        (false, false, false, false) => "kernel read non-present page",
-        (false, false, false, true) => "kernel fetch non-present page",
-        (false, true, false, false) => "kernel write non-present page",
-        (false, false, true, false) => "user read non-present page",
-        (false, false, true, true) => "user fetch non-present page",
-        (false, true, true, false) => "user write non-present page",
+fn decode_page_fault(error: u64) -> &'static str {
+    match (
+        error & page_fault_error::PRESENT != 0,
+        error & page_fault_error::WRITE != 0,
+        error & page_fault_error::USER != 0,
+        error & page_fault_error::INSTRUCTION != 0,
+    ) {
+        (false, false, false, false) => "kernel read of a non-present page",
+        (false, false, false, true) => "kernel instruction fetch from a non-present page",
+        (false, true, false, false) => "kernel write to a non-present page",
+        (false, false, true, false) => "user read of a non-present page",
+        (false, false, true, true) => "user instruction fetch from a non-present page",
+        (false, true, true, false) => "user write to a non-present page",
         (true, false, false, false) => "kernel read protection violation",
-        (true, false, false, true) => "kernel fetch protection violation",
+        (true, false, false, true) => "kernel instruction fetch protection violation",
         (true, true, false, false) => "kernel write protection violation",
         (true, false, true, false) => "user read protection violation",
-        (true, false, true, true) => "user fetch protection violation",
+        (true, false, true, true) => "user instruction fetch protection violation",
         (true, true, true, false) => "user write protection violation",
-        _ => "unknown page fault",
+        _ => "unclassified page fault",
     }
 }
 
-// =============================================================================
-// Exception handlers without error code
-// =============================================================================
+/// Common report path for fatal (and recoverable) exceptions.
+fn report(
+    title: &str,
+    error: Option<u64>,
+    regs: &SavedRegisters,
+    frame: &InterruptStackFrame,
+    fatal: bool,
+) {
+    // The fault may have happened while the console lock was held.
+    crate::console::force_unlock();
 
-macro_rules! exception_handler {
-    ($name:ident, $msg:expr, recoverable: $recoverable:expr) => {
-        #[naked]
-        pub extern "C" fn $name() {
-            unsafe {
-                core::arch::asm!(
-                    // Save all general purpose registers
-                    "push rax",
-                    "push rbx",
-                    "push rcx",
-                    "push rdx",
-                    "push rsi",
-                    "push rdi",
-                    "push rbp",
-                    "push r8",
-                    "push r9",
-                    "push r10",
-                    "push r11",
-                    "push r12",
-                    "push r13",
-                    "push r14",
-                    "push r15",
-                    // Pass pointer to ExceptionContext as first argument
-                    "mov rdi, rsp",
-                    "call {}",
-                    // Restore registers
-                    "pop r15",
-                    "pop r14",
-                    "pop r13",
-                    "pop r12",
-                    "pop r11",
-                    "pop r10",
-                    "pop r9",
-                    "pop r8",
-                    "pop rbp",
-                    "pop rdi",
-                    "pop rsi",
-                    "pop rdx",
-                    "pop rcx",
-                    "pop rbx",
-                    "pop rax",
-                    "iretq",
-                    sym $name##_inner,
-                    options(noreturn)
-                )
-            }
-        }
-        
-        extern "C" fn $name##_inner(ctx: *const ExceptionContext) {
-            let ctx = unsafe { &*ctx };
-            
-            kprintln!();
-            kprintln!("==================== EXCEPTION ====================");
-            kprintln!("  {}", $msg);
-            kprintln!("===================================================");
-            kprintln!();
-            kprintln!("Stack Frame:");
-            ctx.frame.dump();
-            kprintln!();
-            kprintln!("Registers:");
-            ctx.regs.dump();
-            kprintln!();
-            
-            if !$recoverable {
-                kprintln!("FATAL: Cannot recover from this exception. Halting.");
-                cpu::halt_loop();
-            } else {
-                kprintln!("Attempting to continue...");
-            }
-        }
-    };
+    kprintln!();
+    kprintln!("=================== EXCEPTION ===================");
+    kprintln!("  {}", title);
+    if let Some(code) = error {
+        kprintln!("  error code: {:#018x}", code);
+    }
+    kprintln!("=================================================");
+    kprintln!("  frame:");
+    frame.dump();
+    kprintln!("  registers:");
+    regs.dump();
+    kprintln!();
+
+    if fatal {
+        kprintln!("FATAL: this exception cannot be recovered. Halting.");
+        cpu::halt_loop();
+    }
+    kprintln!("(recoverable exception ignored)");
 }
 
-// =============================================================================
-// Exception handlers with error code
-// =============================================================================
-
-macro_rules! exception_handler_with_error {
-    ($name:ident, $msg:expr, recoverable: $recoverable:expr) => {
-        #[naked]
-        pub extern "C" fn $name() {
-            unsafe {
-                core::arch::asm!(
-                    // Save all general purpose registers
-                    "push rax",
-                    "push rbx",
-                    "push rcx",
-                    "push rdx",
-                    "push rsi",
-                    "push rdi",
-                    "push rbp",
-                    "push r8",
-                    "push r9",
-                    "push r10",
-                    "push r11",
-                    "push r12",
-                    "push r13",
-                    "push r14",
-                    "push r15",
-                    // Pass pointer to ExceptionContextWithError as first argument
-                    "mov rdi, rsp",
-                    "call {}",
-                    // Restore registers
-                    "pop r15",
-                    "pop r14",
-                    "pop r13",
-                    "pop r12",
-                    "pop r11",
-                    "pop r10",
-                    "pop r9",
-                    "pop r8",
-                    "pop rbp",
-                    "pop rdi",
-                    "pop rsi",
-                    "pop rdx",
-                    "pop rcx",
-                    "pop rbx",
-                    "pop rax",
-                    "add rsp, 8", // Pop error code
-                    "iretq",
-                    sym $name##_inner,
-                    options(noreturn)
-                )
-            }
+/// Exception without an error code.
+macro_rules! exception_no_error {
+    ($stub:ident, $inner:ident, $title:literal, fatal: $fatal:expr) => {
+        #[unsafe(naked)]
+        pub extern "C" fn $stub() -> ! {
+            core::arch::naked_asm!(
+                "push rax",
+                "push rbx",
+                "push rcx",
+                "push rdx",
+                "push rsi",
+                "push rdi",
+                "push rbp",
+                "push r8",
+                "push r9",
+                "push r10",
+                "push r11",
+                "push r12",
+                "push r13",
+                "push r14",
+                "push r15",
+                // Align the stack to 16 bytes for the Rust handler.
+                "mov rbp, rsp",
+                "and rsp, -16",
+                "mov rdi, rbp",
+                "call {handler}",
+                "mov rsp, rbp",
+                "pop r15",
+                "pop r14",
+                "pop r13",
+                "pop r12",
+                "pop r11",
+                "pop r10",
+                "pop r9",
+                "pop r8",
+                "pop rbp",
+                "pop rdi",
+                "pop rsi",
+                "pop rdx",
+                "pop rcx",
+                "pop rbx",
+                "pop rax",
+                "iretq",
+                handler = sym $inner
+            )
         }
-        
-        extern "C" fn $name##_inner(ctx: *const ExceptionContextWithError) {
-            let ctx = unsafe { &*ctx };
-            
-            kprintln!();
-            kprintln!("==================== EXCEPTION ====================");
-            kprintln!("  {}", $msg);
-            kprintln!("  Error Code: {:#018x}", ctx.error_code);
-            kprintln!("===================================================");
-            kprintln!();
-            kprintln!("Stack Frame:");
-            ctx.frame.dump();
-            kprintln!();
-            kprintln!("Registers:");
-            ctx.regs.dump();
-            kprintln!();
-            
-            if !$recoverable {
-                kprintln!("FATAL: Cannot recover from this exception. Halting.");
-                cpu::halt_loop();
-            } else {
-                kprintln!("Attempting to continue...");
-            }
+
+        extern "C" fn $inner(ctx: &ExceptionContext) {
+            report($title, None, &ctx.regs, &ctx.frame, $fatal);
         }
     };
 }
 
-// =============================================================================
-// CPU Exception Handlers
-// =============================================================================
+/// Exception whose frame carries an error code.
+macro_rules! exception_with_error {
+    ($stub:ident, $inner:ident, $title:literal, fatal: $fatal:expr) => {
+        #[unsafe(naked)]
+        pub extern "C" fn $stub() -> ! {
+            core::arch::naked_asm!(
+                "push rax",
+                "push rbx",
+                "push rcx",
+                "push rdx",
+                "push rsi",
+                "push rdi",
+                "push rbp",
+                "push r8",
+                "push r9",
+                "push r10",
+                "push r11",
+                "push r12",
+                "push r13",
+                "push r14",
+                "push r15",
+                "mov rbp, rsp",
+                "and rsp, -16",
+                "mov rdi, rbp",
+                "call {handler}",
+                "mov rsp, rbp",
+                "pop r15",
+                "pop r14",
+                "pop r13",
+                "pop r12",
+                "pop r11",
+                "pop r10",
+                "pop r9",
+                "pop r8",
+                "pop rbp",
+                "pop rdi",
+                "pop rsi",
+                "pop rdx",
+                "pop rcx",
+                "pop rbx",
+                "pop rax",
+                "add rsp, 8", // discard the CPU error code
+                "iretq",
+                handler = sym $inner
+            )
+        }
 
-// Recoverable exceptions (can potentially continue execution)
-exception_handler!(divide_error, "Division by Zero (#DE)", recoverable: false);
-exception_handler!(debug, "Debug (#DB)", recoverable: true);
-exception_handler!(breakpoint, "Breakpoint (#BP)", recoverable: true);
-exception_handler!(overflow, "Overflow (#OF)", recoverable: true);
-exception_handler!(bound_range, "Bound Range Exceeded (#BR)", recoverable: false);
-exception_handler!(invalid_opcode, "Invalid Opcode (#UD)", recoverable: false);
-exception_handler!(device_not_available, "Device Not Available (#NM)", recoverable: false);
-exception_handler!(x87_floating_point, "x87 Floating-Point Exception (#MF)", recoverable: false);
-exception_handler!(simd_floating_point, "SIMD Floating-Point Exception (#XM)", recoverable: false);
-exception_handler!(virtualization, "Virtualization Exception (#VE)", recoverable: false);
-
-// Non-Maskable Interrupt - special handling
-exception_handler!(nmi, "Non-Maskable Interrupt (NMI)", recoverable: true);
-
-// Fatal exceptions with error codes
-exception_handler_with_error!(double_fault, "Double Fault (#DF)", recoverable: false);
-exception_handler_with_error!(invalid_tss, "Invalid TSS (#TS)", recoverable: false);
-exception_handler_with_error!(segment_not_present, "Segment Not Present (#NP)", recoverable: false);
-exception_handler_with_error!(stack_segment, "Stack-Segment Fault (#SS)", recoverable: false);
-exception_handler_with_error!(alignment_check, "Alignment Check (#AC)", recoverable: false);
-
-// Machine check - always fatal
-exception_handler!(machine_check, "Machine Check (#MC) - HARDWARE ERROR", recoverable: false);
-
-// =============================================================================
-// Special Exception Handlers (with custom logic)
-// =============================================================================
-
-/// General Protection Fault handler - provides detailed error information
-#[naked]
-pub extern "C" fn general_protection() {
-    unsafe {
-        core::arch::asm!(
-            "push rax",
-            "push rbx",
-            "push rcx",
-            "push rdx",
-            "push rsi",
-            "push rdi",
-            "push rbp",
-            "push r8",
-            "push r9",
-            "push r10",
-            "push r11",
-            "push r12",
-            "push r13",
-            "push r14",
-            "push r15",
-            "mov rdi, rsp",
-            "call {}",
-            "pop r15",
-            "pop r14",
-            "pop r13",
-            "pop r12",
-            "pop r11",
-            "pop r10",
-            "pop r9",
-            "pop r8",
-            "pop rbp",
-            "pop rdi",
-            "pop rsi",
-            "pop rdx",
-            "pop rcx",
-            "pop rbx",
-            "pop rax",
-            "add rsp, 8",
-            "iretq",
-            sym general_protection_inner,
-            options(noreturn)
-        )
-    }
+        extern "C" fn $inner(ctx: &ExceptionContextWithError) {
+            report(
+                $title,
+                Some(ctx.error_code),
+                &ctx.regs,
+                &ctx.frame,
+                $fatal,
+            );
+        }
+    };
 }
 
-extern "C" fn general_protection_inner(ctx: *const ExceptionContextWithError) {
-    let ctx = unsafe { &*ctx };
-    
-    kprintln!();
-    kprintln!("==================== EXCEPTION ====================");
-    kprintln!("  General Protection Fault (#GP)");
-    kprintln!("===================================================");
-    kprintln!();
-    
-    // Decode error code for #GP
+/// IRQ entry stub (no error code, EOI is sent by the handler).
+///
+/// `$body` must already exist as an `extern "C" fn()` in this module.
+macro_rules! irq_stub {
+    ($stub:ident, $body:ident) => {
+        #[unsafe(naked)]
+        pub extern "C" fn $stub() -> ! {
+            core::arch::naked_asm!(
+                "push rax",
+                "push rbx",
+                "push rcx",
+                "push rdx",
+                "push rsi",
+                "push rdi",
+                "push rbp",
+                "push r8",
+                "push r9",
+                "push r10",
+                "push r11",
+                "push r12",
+                "push r13",
+                "push r14",
+                "push r15",
+                "mov rbp, rsp",
+                "and rsp, -16",
+                "call {handler}",
+                "mov rsp, rbp",
+                "pop r15",
+                "pop r14",
+                "pop r13",
+                "pop r12",
+                "pop r11",
+                "pop r10",
+                "pop r9",
+                "pop r8",
+                "pop rbp",
+                "pop rdi",
+                "pop rsi",
+                "pop rdx",
+                "pop rcx",
+                "pop rbx",
+                "pop rax",
+                "iretq",
+                handler = sym $body
+            )
+        }
+    };
+}
+
+exception_no_error!(divide_error, divide_error_inner, "Divide error (#DE)", fatal: true);
+exception_no_error!(debug, debug_inner, "Debug (#DB)", fatal: false);
+exception_no_error!(nmi, nmi_inner, "Non-maskable interrupt", fatal: false);
+exception_no_error!(breakpoint, breakpoint_inner, "Breakpoint (#BP)", fatal: false);
+exception_no_error!(overflow, overflow_inner, "Overflow (#OF)", fatal: false);
+exception_no_error!(bound_range, bound_range_inner, "Bound range exceeded (#BR)", fatal: true);
+exception_no_error!(invalid_opcode, invalid_opcode_inner, "Invalid opcode (#UD)", fatal: true);
+exception_no_error!(device_not_available, device_not_available_inner, "Device not available (#NM)", fatal: true);
+exception_no_error!(x87_floating_point, x87_floating_point_inner, "x87 floating point (#MF)", fatal: true);
+exception_no_error!(simd_floating_point, simd_floating_point_inner, "SIMD floating point (#XM)", fatal: true);
+exception_no_error!(virtualization, virtualization_inner, "Virtualization exception (#VE)", fatal: true);
+exception_no_error!(machine_check, machine_check_inner, "Machine check (#MC) - hardware error", fatal: true);
+
+exception_with_error!(double_fault, double_fault_inner, "Double fault (#DF)", fatal: true);
+exception_with_error!(invalid_tss, invalid_tss_inner, "Invalid TSS (#TS)", fatal: true);
+exception_with_error!(segment_not_present, segment_not_present_inner, "Segment not present (#NP)", fatal: true);
+exception_with_error!(stack_segment, stack_segment_inner, "Stack segment fault (#SS)", fatal: true);
+exception_with_error!(alignment_check, alignment_check_inner, "Alignment check (#AC)", fatal: true);
+exception_with_error!(general_protection, general_protection_inner, "General protection fault (#GP)", fatal: true);
+
+/// Page fault entry, with CR2 decoding.
+#[unsafe(naked)]
+pub extern "C" fn page_fault() -> ! {
+    core::arch::naked_asm!(
+        "push rax",
+        "push rbx",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rbp, rsp",
+        "and rsp, -16",
+        "mov rdi, rbp",
+        "call {handler}",
+        "mov rsp, rbp",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rbp",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rbx",
+        "pop rax",
+        "add rsp, 8",
+        "iretq",
+        handler = sym page_fault_inner
+            )
+}
+
+extern "C" fn page_fault_inner(ctx: &ExceptionContextWithError) {
+    use page_fault_error::*;
+
+    crate::console::force_unlock();
+
+    let address = cpu::read_cr2();
     let error = ctx.error_code;
-    if error == 0 {
-        kprintln!("Cause: Unspecified (error code = 0)");
-        kprintln!("  Possible causes:");
-        kprintln!("  - Accessing invalid memory");
-        kprintln!("  - Privilege level violation");
-        kprintln!("  - Writing to read-only segment");
-    } else {
-        // Error code contains segment selector index
-        let external = error & 1 != 0;
-        let table = (error >> 1) & 0x3;
-        let index = (error >> 3) & 0x1FFF;
-        
-        let table_name = match table {
-            0 => "GDT",
-            1 => "IDT",
-            2 => "LDT",
-            3 => "IDT",
-            _ => "Unknown",
-        };
-        
-        kprintln!("Error Code: {:#06x}", error);
-        kprintln!("  External: {}", external);
-        kprintln!("  Table: {} ({})", table, table_name);
-        kprintln!("  Selector Index: {}", index);
-    }
-    
+
     kprintln!();
-    kprintln!("Stack Frame:");
+    kprintln!("================== PAGE FAULT ==================");
+    kprintln!("  faulting address: {:#018x}", address);
+    kprintln!("  cause:            {}", decode_page_fault(error));
+    kprintln!("  error code:       {:#018x}", error);
+    kprintln!(
+        "  [present={} write={} user={} reserved={} fetch={}]",
+        error & PRESENT != 0,
+        error & WRITE != 0,
+        error & USER != 0,
+        error & RESERVED != 0,
+        error & INSTRUCTION != 0
+    );
+    kprintln!("===============================================");
+    kprintln!("  frame:");
     ctx.frame.dump();
-    kprintln!();
-    kprintln!("Registers:");
+    kprintln!("  registers:");
     ctx.regs.dump();
     kprintln!();
-    kprintln!("FATAL: Cannot recover from General Protection Fault. Halting.");
+    kprintln!("FATAL: unhandled page fault. Halting.");
     cpu::halt_loop();
 }
 
-/// Page Fault handler - reads CR2 and provides detailed information
-#[naked]
-pub extern "C" fn page_fault() {
-    unsafe {
-        core::arch::asm!(
-            "push rax",
-            "push rbx",
-            "push rcx",
-            "push rdx",
-            "push rsi",
-            "push rdi",
-            "push rbp",
-            "push r8",
-            "push r9",
-            "push r10",
-            "push r11",
-            "push r12",
-            "push r13",
-            "push r14",
-            "push r15",
-            "mov rdi, rsp",
-            "call {}",
-            "pop r15",
-            "pop r14",
-            "pop r13",
-            "pop r12",
-            "pop r11",
-            "pop r10",
-            "pop r9",
-            "pop r8",
-            "pop rbp",
-            "pop rdi",
-            "pop rsi",
-            "pop rdx",
-            "pop rcx",
-            "pop rbx",
-            "pop rax",
-            "add rsp, 8",
-            "iretq",
-            sym page_fault_inner,
-            options(noreturn)
-        )
-    }
+/// Installed on every vector we do not handle explicitly.
+#[unsafe(naked)]
+pub extern "C" fn spurious() -> ! {
+    core::arch::naked_asm!("iretq")
 }
 
-extern "C" fn page_fault_inner(ctx: *const ExceptionContextWithError) {
-    let ctx = unsafe { &*ctx };
-    
-    // Read CR2 to get the faulting address
-    let faulting_address = cpu::read_cr2();
-    let error = ctx.error_code;
-    
-    kprintln!();
-    kprintln!("==================== PAGE FAULT ====================");
-    kprintln!("  Faulting Address: {:#018x}", faulting_address);
-    kprintln!("  Error Code:       {:#018x}", error);
-    kprintln!("====================================================");
-    kprintln!();
-    
-    // Decode error code
-    kprintln!("Fault Details:");
-    kprintln!("  Cause: {}", decode_page_fault_error(error));
-    kprintln!("  Page Present:      {}", if error & page_fault_error::PRESENT != 0 { "Yes" } else { "No" });
-    kprintln!("  Access Type:       {}", if error & page_fault_error::WRITE != 0 { "Write" } else { "Read" });
-    kprintln!("  Privilege Level:   {}", if error & page_fault_error::USER != 0 { "User" } else { "Kernel" });
-    kprintln!("  Reserved Bit Set:  {}", if error & page_fault_error::RESERVED != 0 { "Yes" } else { "No" });
-    kprintln!("  Instruction Fetch: {}", if error & page_fault_error::INSTRUCTION != 0 { "Yes" } else { "No" });
-    
-    kprintln!();
-    kprintln!("Stack Frame:");
-    ctx.frame.dump();
-    kprintln!();
-    kprintln!("Registers:");
-    ctx.regs.dump();
-    kprintln!();
-    
-    // In the future, we could attempt recovery here:
-    // - If it's a demand paging fault, allocate the page
-    // - If it's a copy-on-write fault, copy the page
-    // - If it's a stack growth fault, grow the stack
-    
-    kprintln!("FATAL: Page fault cannot be handled yet. Halting.");
-    cpu::halt_loop();
-}
+irq_stub!(timer_interrupt, timer_interrupt_body);
+irq_stub!(keyboard_interrupt, keyboard_interrupt_body);
 
-// =============================================================================
-// Hardware IRQ Handlers
-// =============================================================================
-
-/// Timer interrupt handler (IRQ0, vector 32)
-#[naked]
-pub extern "C" fn timer_interrupt() {
-    unsafe {
-        core::arch::asm!(
-            "push rax",
-            "push rbx",
-            "push rcx",
-            "push rdx",
-            "push rsi",
-            "push rdi",
-            "push rbp",
-            "push r8",
-            "push r9",
-            "push r10",
-            "push r11",
-            "push r12",
-            "push r13",
-            "push r14",
-            "push r15",
-            "call {}",
-            "pop r15",
-            "pop r14",
-            "pop r13",
-            "pop r12",
-            "pop r11",
-            "pop r10",
-            "pop r9",
-            "pop r8",
-            "pop rbp",
-            "pop rdi",
-            "pop rsi",
-            "pop rdx",
-            "pop rcx",
-            "pop rbx",
-            "pop rax",
-            "iretq",
-            sym timer_interrupt_inner,
-            options(noreturn)
-        )
-    }
-}
-
-extern "C" fn timer_interrupt_inner() {
+extern "C" fn timer_interrupt_body() {
     timer::handle_interrupt();
 }
 
-/// Keyboard interrupt handler (IRQ1, vector 33)
-#[naked]
-pub extern "C" fn keyboard_interrupt() {
-    unsafe {
-        core::arch::asm!(
-            "push rax",
-            "push rbx",
-            "push rcx",
-            "push rdx",
-            "push rsi",
-            "push rdi",
-            "push rbp",
-            "push r8",
-            "push r9",
-            "push r10",
-            "push r11",
-            "push r12",
-            "push r13",
-            "push r14",
-            "push r15",
-            "call {}",
-            "pop r15",
-            "pop r14",
-            "pop r13",
-            "pop r12",
-            "pop r11",
-            "pop r10",
-            "pop r9",
-            "pop r8",
-            "pop rbp",
-            "pop rdi",
-            "pop rsi",
-            "pop rdx",
-            "pop rcx",
-            "pop rbx",
-            "pop rax",
-            "iretq",
-            sym keyboard_interrupt_inner,
-            options(noreturn)
-        )
-    }
-}
-
-extern "C" fn keyboard_interrupt_inner() {
+extern "C" fn keyboard_interrupt_body() {
     keyboard::handle_interrupt();
 }

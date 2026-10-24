@@ -1,0 +1,13 @@
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+# No red zone: interrupt handlers push onto the current stack.
+rustflags = [
+    "-C", "no-redzone=yes",
+    "-C", "force-frame-pointers=yes",
+]
+
+[unstable]
+# `core` for x86_64-unknown-none is a prebuilt target, no build-std needed.
+build-std = []

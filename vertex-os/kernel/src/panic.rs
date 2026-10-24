@@ -1,32 +1,31 @@
-//! Panic handler for the kernel
+//! Kernel panic handler.
 
 use core::panic::PanicInfo;
+
 use crate::arch::x86_64::cpu;
-use crate::kprintln;
+use crate::console::FG_ERROR;
+use crate::{kprintln, kprintln_color};
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    // Disable interrupts
     cpu::cli();
-    
-    kprintln!();
-    kprintln!("!!! KERNEL PANIC !!!");
-    kprintln!();
-    
+    // The fault may have happened while the console lock was held.
+    crate::console::force_unlock();
+    crate::console::force_unlock_capture();
+
+    kprintln_color!(FG_ERROR, "\n!!! KERNEL PANIC !!!");
     if let Some(location) = info.location() {
-        kprintln!("Location: {}:{}:{}", 
-            location.file(), 
-            location.line(), 
+        kprintln_color!(
+            FG_ERROR,
+            "  at {}:{}:{}",
+            location.file(),
+            location.line(),
             location.column()
         );
     }
-    
-    if let Some(message) = info.message() {
-        kprintln!("Message: {}", message);
-    }
-    
+    kprintln_color!(FG_ERROR, "  {}", info.message());
     kprintln!();
-    kprintln!("System halted.");
-    
+    kprintln!("System halted. Attach a debugger or reboot.");
+
     cpu::halt_loop();
 }

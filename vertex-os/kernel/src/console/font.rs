@@ -21,6 +21,17 @@ impl Font {
     pub const fn height(&self) -> usize {
         self.height
     }
+
+    /// Bitmap rows for a printable ASCII character.
+    ///
+    /// One byte per row, most significant bit is the leftmost pixel. Unsupported
+    /// characters fall back to a blank cell, matching [`Font::draw_char`].
+    pub fn glyph_rows(&self, c: char) -> &'static [u8] {
+        let code = c as usize;
+        let index = if (32..128).contains(&code) { code - 32 } else { 0 };
+        let start = index * self.height;
+        &self.data[start..start + self.height]
+    }
     
     /// Draw a character at the given position
     pub fn draw_char(

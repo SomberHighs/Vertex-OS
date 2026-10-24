@@ -1,164 +1,31 @@
-# Vertex OS
+# Vertex OS (kernel source tree)
 
-A hobby operating system kernel written in Rust, targeting x86_64 architecture.
+This directory contains the kernel, the graphical front end, the node-graph
+prototype and the build tooling.
 
-## Features
+The authoritative documentation — architecture, build instructions, key
+bindings, shell commands, verification and known limitations — is in the
+[project README](../README.md).
 
-- **Limine Bootloader**: Uses the modern Limine boot protocol
-- **Framebuffer Console**: Text output via VESA framebuffer with built-in font
-- **Memory Management**:
-  - Physical Memory Manager (PMM) with bitmap allocator
-  - Virtual Memory Manager (VMM) with 4-level paging support
-- **CPU Architecture Support**:
-  - Global Descriptor Table (GDT)
-  - Interrupt Descriptor Table (IDT)
-  - Exception handlers
-- **Synchronization**: Basic spinlock primitive
-
-## Project Structure
-
-```
-vertex-os/
-├── kernel/
-│   ├── Cargo.toml           # Rust package manifest
-│   ├── rust-toolchain.toml  # Nightly Rust + components
-│   ├── .cargo/config.toml   # Build configuration
-│   ├── linker.ld            # Kernel linker script
-│   ├── limine.conf          # Bootloader configuration
-│   └── src/
-│       ├── main.rs          # Kernel entry point
-│       ├── panic.rs         # Panic handler
-│       ├── arch/x86_64/     # x86_64 architecture code
-│       ├── mm/              # Memory management
-│       ├── console/         # Framebuffer console
-│       └── sync/            # Synchronization primitives
-├── tools/
-│   └── build.sh             # Build and run script
-└── README.md
-```
-
-## Prerequisites
-
-### Required
-
-- **Rust** (nightly): Install via [rustup](https://rustup.rs)
-  ```bash
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-  ```
-
-- **QEMU**: For testing the OS
-  ```bash
-  # Ubuntu/Debian
-  sudo apt install qemu-system-x86
-  
-  # macOS
-  brew install qemu
-  
-  # Windows
-  # Download from https://www.qemu.org/download/#windows
-  ```
-
-### Optional (for ISO creation)
-
-- **xorriso**: For creating bootable ISO images
-  ```bash
-  # Ubuntu/Debian
-  sudo apt install xorriso
-  
-  # macOS
-  brew install xorriso
-  ```
-
-- **OVMF**: For UEFI testing
-  ```bash
-  # Ubuntu/Debian
-  sudo apt install ovmf
-  ```
-
-## Building
-
-### Build the Kernel Only
+Quick reference:
 
 ```bash
-cd kernel
-cargo build --release
+./tools/build.sh run       # build the ISO and boot the desktop (BIOS) in QEMU
+./tools/build.sh run-uefi  # same, with OVMF/UEFI
+./tools/smoke-test.py build/vertex-os.iso --marker "loom ready" \
+    --screenshot artifacts/loom.png
+make test_node && ./test_node   # hosted C prototype of the node model
 ```
 
-### Build and Create ISO
-
-```bash
-chmod +x tools/build.sh
-./tools/build.sh iso
 ```
-
-### Build and Run in QEMU
-
-```bash
-# BIOS mode
-./tools/build.sh run
-
-# UEFI mode
-./tools/build.sh run-uefi
+kernel/src
+├── main.rs            boot sequence and Limine requests
+├── shell.rs           interactive shell and command dispatcher
+├── gui                the Loom: canvas, constellation, panels, desktop loop
+├── arch/x86_64        cpu, gdt, idt, interrupts, pic, timer, keyboard, serial
+├── console            framebuffer, font, coloured console, output capture
+├── mm                 pmm (bitmap), vmm (4-level paging), heap
+├── sched              context switch, tasks, round-robin scheduler
+├── sync               interrupt-safe spinlock, shared cell
+└── vfs                sha256, content-addressed node store, path layer
 ```
-
-### Clean Build Artifacts
-
-```bash
-./tools/build.sh clean
-```
-
-## Architecture
-
-### Boot Process
-
-1. BIOS/UEFI loads Limine bootloader
-2. Limine sets up long mode (64-bit) and higher-half mapping
-3. Limine loads kernel at `0xffffffff80000000`
-4. Kernel entry point `_start()` is called
-5. GDT and IDT are initialized
-6. Framebuffer console is set up
-7. Memory managers are initialized
-8. Kernel enters halt loop
-
-### Memory Layout
-
-- **Higher Half Kernel**: Kernel is loaded at `0xffffffff80000000`
-- **HHDM**: Higher Half Direct Map for physical memory access
-- **Page Size**: 4 KiB pages (2 MiB and 1 GiB huge pages supported)
-
-### Interrupt Handling
-
-The kernel sets up handlers for CPU exceptions (vectors 0-31):
-- Divide Error (#DE)
-- Debug (#DB)
-- NMI
-- Breakpoint (#BP)
-- General Protection Fault (#GP)
-- Page Fault (#PF)
-- And more...
-
-## Development
-
-### Adding New Features
-
-1. Create a new module in the appropriate directory
-2. Add `mod` declaration in the parent `mod.rs`
-3. Use `kprintln!` macro for debug output
-
-### Debugging Tips
-
-- Use `kprintln!` for kernel debug output
-- QEMU's `-serial stdio` flag shows serial output
-- Add `-d int` to QEMU for interrupt debugging
-- Use `-s -S` flags for GDB debugging
-
-## License
-
-This project is open source. Feel free to use, modify, and distribute.
-
-## Resources
-
-- [OSDev Wiki](https://wiki.osdev.org)
-- [Limine Boot Protocol](https://github.com/limine-bootloader/limine/blob/trunk/PROTOCOL.md)
-- [Intel SDM](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html)
-- [Writing an OS in Rust](https://os.phil-opp.com/)

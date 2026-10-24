@@ -1,19 +1,61 @@
-//! PS/2 Keyboard driver
+//! PS/2 keyboard driver.
 //!
-//! Handles keyboard scancodes from port 0x60 and translates them to ASCII
+//! Scancode set 1 is translated to ASCII and pushed into a small ring buffer.
+//! The interrupt handler never prints: the shell drains the buffer from normal
+//! context, which keeps the console lock out of interrupt paths.
+
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::cpu::inb;
 use super::pic;
-use crate::kprint;
+use crate::sync::SyncCell;
 
-/// PS/2 keyboard data port
 const KEYBOARD_DATA_PORT: u16 = 0x60;
+const RX_RING: usize = 256;
 
-/// Keyboard state
-static mut SHIFT_PRESSED: bool = false;
-static mut CAPS_LOCK: bool = false;
-static mut CTRL_PRESSED: bool = false;
-static mut ALT_PRESSED: bool = false;
+struct KeyboardState {
+    shift: bool,
+    caps: bool,
+    ctrl: bool,
+    alt: bool,
+    extended: bool,
+}
+
+static STATE: SyncCell<KeyboardState> = SyncCell::new(KeyboardState {
+    shift: false,
+    caps: false,
+    ctrl: false,
+    alt: false,
+    extended: false,
+});
+
+/// A key press translated from PS/2 scancode set 1.
+///
+/// The graphical front end needs navigation keys that have no ASCII byte, so
+/// the ring buffer stores events instead of characters. [`pop_char`] keeps the
+/// byte-only view used by the text shell.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Key {
+    Char(u8),
+    Enter,
+    Escape,
+    Backspace,
+    Tab,
+    Up,
+    Down,
+    Left,
+    Right,
+    Delete,
+    Home,
+    End,
+    F1,
+    F2,
+    F3,
+}
+
+static RX: SyncCell<[Key; RX_RING]> = SyncCell::new([Key::Char(0); RX_RING]);
+static RX_HEAD: AtomicUsize = AtomicUsize::new(0);
+static RX_TAIL: AtomicUsize = AtomicUsize::new(0);
 
 /// Scancode Set 1 to ASCII mapping (US QWERTY layout)
 /// Index is the scancode, value is the ASCII character (0 = no mapping)
@@ -196,76 +238,149 @@ const SCANCODE_LEFT_CTRL: u8 = 0x1D;
 const SCANCODE_LEFT_ALT: u8 = 0x38;
 const SCANCODE_CAPS_LOCK: u8 = 0x3A;
 
-/// Read a scancode from the keyboard
-pub fn read_scancode() -> u8 {
+/// Unmask IRQ1.
+pub fn init() {
+    pic::enable_irq(pic::IRQ_KEYBOARD);
+}
+
+/// Read the raw scancode byte from the controller.
+fn read_scancode() -> u8 {
     unsafe { inb(KEYBOARD_DATA_PORT) }
 }
 
-/// Process a scancode and return the ASCII character if applicable
-pub fn process_scancode(scancode: u8) -> Option<char> {
+/// Translate a scancode into a key event, tracking modifiers.
+pub fn translate(scancode: u8) -> Option<Key> {
+    let state = unsafe { STATE.get() };
     let released = scancode & 0x80 != 0;
-    let scancode = scancode & 0x7F;
+    let code = scancode & 0x7F;
 
-    unsafe {
-        match scancode {
-            SCANCODE_LEFT_SHIFT | SCANCODE_RIGHT_SHIFT => {
-                SHIFT_PRESSED = !released;
-                return None;
-            }
-            SCANCODE_LEFT_CTRL => {
-                CTRL_PRESSED = !released;
-                return None;
-            }
-            SCANCODE_LEFT_ALT => {
-                ALT_PRESSED = !released;
-                return None;
-            }
-            SCANCODE_CAPS_LOCK if !released => {
-                CAPS_LOCK = !CAPS_LOCK;
-                return None;
-            }
-            _ => {}
-        }
+    if scancode == 0xE0 {
+        state.extended = true;
+        return None;
+    }
 
-        // Only process key press, not release
+    // Extended keys arrive as `0xE0` followed by a make or break code, and the
+    // prefix is repeated for the release, so the flag never outlives one byte.
+    if state.extended {
+        state.extended = false;
         if released {
             return None;
         }
-
-        let ascii = if SHIFT_PRESSED {
-            SCANCODE_TO_ASCII_SHIFT[scancode as usize]
-        } else {
-            SCANCODE_TO_ASCII[scancode as usize]
+        return match code {
+            0x48 => Some(Key::Up),
+            0x50 => Some(Key::Down),
+            0x4B => Some(Key::Left),
+            0x4D => Some(Key::Right),
+            0x53 => Some(Key::Delete),
+            0x47 => Some(Key::Home),
+            0x4F => Some(Key::End),
+            _ => None,
         };
+    }
 
-        if ascii == 0 {
+    match code {
+        SCANCODE_LEFT_SHIFT | SCANCODE_RIGHT_SHIFT => {
+            state.shift = !released;
             return None;
         }
-
-        // Apply caps lock to letters
-        let ascii = if CAPS_LOCK && ascii.is_ascii_alphabetic() {
-            if SHIFT_PRESSED {
-                ascii.to_ascii_lowercase()
-            } else {
-                ascii.to_ascii_uppercase()
-            }
-        } else {
-            ascii
-        };
-
-        Some(ascii as char)
+        SCANCODE_LEFT_CTRL => {
+            state.ctrl = !released;
+            return None;
+        }
+        SCANCODE_LEFT_ALT => {
+            state.alt = !released;
+            return None;
+        }
+        SCANCODE_CAPS_LOCK if !released => {
+            state.caps = !state.caps;
+            return None;
+        }
+        _ => {}
     }
+
+    if released {
+        return None;
+    }
+
+    // Non-character keys: scancode set 1 make codes.
+    match code {
+        0x01 => return Some(Key::Escape),
+        0x0E => return Some(Key::Backspace),
+        0x0F => return Some(Key::Tab),
+        0x1C => return Some(Key::Enter),
+        0x3B => return Some(Key::F1),
+        0x3C => return Some(Key::F2),
+        0x3D => return Some(Key::F3),
+        _ => {}
+    }
+
+    let ascii = if state.shift {
+        SCANCODE_TO_ASCII_SHIFT[code as usize]
+    } else {
+        SCANCODE_TO_ASCII[code as usize]
+    };
+    if ascii == 0 {
+        return None;
+    }
+
+    let ascii = if state.caps && ascii.is_ascii_alphabetic() {
+        if state.shift {
+            ascii.to_ascii_lowercase()
+        } else {
+            ascii.to_ascii_uppercase()
+        }
+    } else {
+        ascii
+    };
+
+    Some(Key::Char(ascii))
 }
 
-/// Keyboard interrupt handler - called from the IRQ handler
+fn push_key(key: Key) {
+    let head = RX_HEAD.load(Ordering::Relaxed);
+    let next = (head + 1) % RX_RING;
+    if next == RX_TAIL.load(Ordering::Relaxed) {
+        return; // buffer full: drop the keystroke
+    }
+    unsafe {
+        RX.get()[head] = key;
+    }
+    RX_HEAD.store(next, Ordering::Release);
+}
+
+/// IRQ1 handler.
 pub fn handle_interrupt() {
     let scancode = read_scancode();
-    
-    if let Some(c) = process_scancode(scancode) {
-        // For now, just print the character
-        kprint!("{}", c);
+    if let Some(key) = translate(scancode) {
+        push_key(key);
     }
-    
-    // Send End of Interrupt to PIC
     pic::send_eoi(pic::IRQ_KEYBOARD);
+}
+
+/// Pop the oldest key event, if any.
+pub fn pop_key() -> Option<Key> {
+    let head = RX_HEAD.load(Ordering::Acquire);
+    let tail = RX_TAIL.load(Ordering::Relaxed);
+    if head == tail {
+        return None;
+    }
+    let key = unsafe { RX.get()[tail] };
+    RX_TAIL.store((tail + 1) % RX_RING, Ordering::Release);
+    Some(key)
+}
+
+/// Pop a character for line-oriented consumers.
+///
+/// Navigation and function keys are dropped here; the text shell treats Enter,
+/// Backspace and Tab as the control bytes it already understands.
+pub fn pop_char() -> Option<u8> {
+    loop {
+        match pop_key()? {
+            Key::Char(c) => return Some(c),
+            Key::Enter => return Some(b'\r'),
+            Key::Backspace => return Some(0x08),
+            Key::Tab => return Some(b'\t'),
+            _ => continue,
+        }
+    }
 }
