@@ -11,7 +11,7 @@ protocol. Everything in the system — files, directories, users — is an
 immutable *node* identified by the SHA-256 of its content, wired together by
 typed edges.
 
-![The Loom, Vertex OS's graphical front end](docs/loom.png)
+![The Loom, Vertex OS's graphical front end](vertex-os/docs/loom.png)
 
 It boots into **the Loom**, a desktop where the node graph is the interface: the
 current directory is a constellation of orbiting nodes, the inspector shows the
@@ -327,7 +327,7 @@ Repository root:
 ```
 .github/workflows/build.yml   # CI: build the ISO, run the boot tests
 README.md                     # this document
-docs/loom.png                 # screenshot of the front end
+vertex-os/docs/loom.png       # screenshot of the front end
 ```
 
 The C prototype (`graph/node.c`, `graph/node.h`) predates the kernel
